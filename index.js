@@ -1,6 +1,8 @@
 const express = require("express");
 const app = express();
 const axios = require("axios");
+const http = require("http");
+const net = require("net");
 const os = require('os');
 const fs = require("fs");
 const path = require("path");
@@ -22,6 +24,16 @@ const ARGO_PORT = process.env.ARGO_PORT || 8001;            // 固定隧道端�
 const CFIP = process.env.CFIP || 'saas.sin.fan';            // 节点优选域名或优选ip  
 const CFPORT = process.env.CFPORT || 443;                   // 节点优选域名或优选ip对应的端口
 const NAME = process.env.NAME || '';                        // 节点名称
+const SING_BOX_VERSION = process.env.SING_BOX_VERSION || '1.13.13';
+const SING_BOX_AMD_URL = process.env.SING_BOX_AMD_URL || `https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz`;
+const SING_BOX_ARM_URL = process.env.SING_BOX_ARM_URL || `https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-arm64.tar.gz`;
+const WS_EARLY_DATA = Number.parseInt(process.env.WS_EARLY_DATA || '0', 10) || 0;
+const WS_ROUTES = {
+  '/vless-argo': 3002,
+  '/vmess-argo': 3003,
+  '/trojan-argo': 3004,
+};
+let tunnelRouterStarted = false;
 
 // 创建运行文件夹
 if (!fs.existsSync(FILE_PATH)) {
@@ -54,6 +66,7 @@ let subPath = path.join(FILE_PATH, 'sub.txt');
 let listPath = path.join(FILE_PATH, 'list.txt');
 let bootLogPath = path.join(FILE_PATH, 'boot.log');
 let configPath = path.join(FILE_PATH, 'config.json');
+let appServer;
 
 // 如果订阅器上存在历史运行节点则先删除
 function deleteNodes() {
@@ -87,6 +100,17 @@ function deleteNodes() {
   }
 }
 
+function removePathSafely(targetPath) {
+  try {
+    const basePath = path.resolve(FILE_PATH);
+    const resolvedPath = path.resolve(targetPath);
+    if (resolvedPath !== basePath && !resolvedPath.startsWith(`${basePath}${path.sep}`)) return;
+    fs.rmSync(resolvedPath, { recursive: true, force: true });
+  } catch (err) {
+    // 忽略所有错误，不记录日志
+  }
+}
+
 // 清理历史文件
 function cleanupOldFiles() {
   try {
@@ -94,10 +118,7 @@ function cleanupOldFiles() {
     files.forEach(file => {
       const filePath = path.join(FILE_PATH, file);
       try {
-        const stat = fs.statSync(filePath);
-        if (stat.isFile()) {
-          fs.unlinkSync(filePath);
-        }
+        removePathSafely(filePath);
       } catch (err) {
         // 忽略所有错误，不记录日志
       }
@@ -107,19 +128,26 @@ function cleanupOldFiles() {
   }
 }
 
-// 生成xr-ay配置文件
+function getWsTransport(pathValue) {
+  const transport = { type: 'ws', path: pathValue };
+  if (WS_EARLY_DATA > 0) {
+    transport.max_early_data = WS_EARLY_DATA;
+    transport.early_data_header_name = 'Sec-WebSocket-Protocol';
+  }
+  return transport;
+}
+
+// 生成sing-box配置文件
 async function generateConfig() {
+  const multiplex = { enabled: true, padding: false };
   const config = {
-    log: { access: '/dev/null', error: '/dev/null', loglevel: 'none' },
+    log: { disabled: true },
     inbounds: [
-      { port: ARGO_PORT, protocol: 'vless', settings: { clients: [{ id: UUID, flow: 'xtls-rprx-vision' }], decryption: 'none', fallbacks: [{ dest: 3001 }, { path: "/vless-argo", dest: 3002 }, { path: "/vmess-argo", dest: 3003 }, { path: "/trojan-argo", dest: 3004 }] }, streamSettings: { network: 'tcp' } },
-      { port: 3001, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID }], decryption: "none" }, streamSettings: { network: "tcp", security: "none" } },
-      { port: 3002, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID, level: 0 }], decryption: "none" }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/vless-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
-      { port: 3003, listen: "127.0.0.1", protocol: "vmess", settings: { clients: [{ id: UUID, alterId: 0 }] }, streamSettings: { network: "ws", wsSettings: { path: "/vmess-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
-      { port: 3004, listen: "127.0.0.1", protocol: "trojan", settings: { clients: [{ password: UUID }] }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/trojan-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
+      { type: 'vless', tag: 'vless-in', listen: '127.0.0.1', listen_port: 3002, users: [{ uuid: UUID }], multiplex, transport: getWsTransport('/vless-argo') },
+      { type: 'vmess', tag: 'vmess-in', listen: '127.0.0.1', listen_port: 3003, users: [{ uuid: UUID, alterId: 0 }], multiplex, transport: getWsTransport('/vmess-argo') },
+      { type: 'trojan', tag: 'trojan-in', listen: '127.0.0.1', listen_port: 3004, users: [{ password: UUID }], multiplex, transport: getWsTransport('/trojan-argo') },
     ],
-    dns: { servers: ["https+local://8.8.8.8/dns-query"] },
-    outbounds: [ { protocol: "freedom", tag: "direct" }, {protocol: "blackhole", tag: "block"} ]
+    outbounds: [ { type: 'direct', tag: 'direct' }, { type: 'block', tag: 'block' } ]
   };
   fs.writeFileSync(path.join(FILE_PATH, 'config.json'), JSON.stringify(config, null, 2));
 }
@@ -173,6 +201,103 @@ function downloadFile(fileName, fileUrl, callback) {
     });
 }
 
+async function extractSingBoxArchive(fileInfo) {
+  const archivePath = fileInfo.fileName;
+  const outputPath = fileInfo.outputPath || webPath;
+  const extractDir = path.join(FILE_PATH, fileInfo.extractDirName);
+  const extractedBinary = path.join(extractDir, 'sing-box');
+
+  try {
+    await exec(`tar -xzf "${archivePath}" -C "${FILE_PATH}"`);
+    if (!fs.existsSync(extractedBinary)) {
+      throw new Error(`sing-box binary not found in ${extractDir}`);
+    }
+    fs.renameSync(extractedBinary, outputPath);
+    removePathSafely(archivePath);
+    removePathSafely(extractDir);
+    console.log(`Extract ${path.basename(outputPath)} successfully`);
+  } catch (error) {
+    console.error(`Extract sing-box failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function prepareDownloadedFile(fileInfo) {
+  if (fileInfo.extract === 'sing-box') {
+    await extractSingBoxArchive(fileInfo);
+  }
+}
+
+function getRoutePath(reqUrl) {
+  try {
+    return new URL(reqUrl, 'http://localhost').pathname;
+  } catch (error) {
+    return (reqUrl || '').split('?')[0];
+  }
+}
+
+function writeNotFound(socket) {
+  if (!socket.destroyed) {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+  }
+}
+
+function proxyWebSocketUpgrade(req, socket, head) {
+  const routePath = getRoutePath(req.url);
+  const targetPort = WS_ROUTES[routePath];
+  if (!targetPort) {
+    writeNotFound(socket);
+    return;
+  }
+
+  const upstream = net.connect(targetPort, '127.0.0.1', () => {
+    let headerText = `${req.method} ${routePath} HTTP/${req.httpVersion}\r\n`;
+    Object.entries(req.headers).forEach(([name, value]) => {
+      if (Array.isArray(value)) {
+        value.forEach(item => { headerText += `${name}: ${item}\r\n`; });
+      } else if (value !== undefined) {
+        headerText += `${name}: ${value}\r\n`;
+      }
+    });
+    upstream.write(`${headerText}\r\n`);
+    if (head && head.length > 0) upstream.write(head);
+    socket.pipe(upstream).pipe(socket);
+  });
+
+  upstream.on('error', () => {
+    if (!socket.destroyed) socket.destroy();
+  });
+  socket.on('error', () => {
+    if (!upstream.destroyed) upstream.destroy();
+  });
+}
+
+function startTunnelRouter() {
+  if (tunnelRouterStarted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (Number(ARGO_PORT) === Number(PORT) && appServer) {
+      appServer.on('upgrade', proxyWebSocketUpgrade);
+      tunnelRouterStarted = true;
+      console.log(`websocket router is attached on http port:${PORT}!`);
+      resolve();
+      return;
+    }
+
+    const tunnelServer = http.createServer((req, res) => {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not Found');
+    });
+    tunnelServer.on('upgrade', proxyWebSocketUpgrade);
+    tunnelServer.on('error', reject);
+    tunnelServer.listen(Number(ARGO_PORT), () => {
+      tunnelRouterStarted = true;
+      console.log(`websocket router is running on port:${ARGO_PORT}!`);
+      resolve();
+    });
+  });
+}
+
 // 下载并运行依赖文件
 async function downloadFilesAndRun() {  
   
@@ -190,14 +315,18 @@ async function downloadFilesAndRun() {
         if (err) {
           reject(err);
         } else {
-          resolve(filePath);
+          resolve({ ...fileInfo, downloadedPath: filePath });
         }
       });
     });
   });
 
+  let downloadedFiles;
   try {
-    await Promise.all(downloadPromises);
+    downloadedFiles = await Promise.all(downloadPromises);
+    for (const fileInfo of downloadedFiles) {
+      await prepareDownloadedFile(fileInfo);
+    }
   } catch (err) {
     console.error('Error downloading files:', err);
     return;
@@ -207,13 +336,12 @@ async function downloadFilesAndRun() {
     const newPermissions = 0o775;
     filePaths.forEach(absoluteFilePath => {
       if (fs.existsSync(absoluteFilePath)) {
-        fs.chmod(absoluteFilePath, newPermissions, (err) => {
-          if (err) {
-            console.error(`Empowerment failed for ${absoluteFilePath}: ${err}`);
-          } else {
-            console.log(`Empowerment success for ${absoluteFilePath}: ${newPermissions.toString(8)}`);
-          }
-        });
+        try {
+          fs.chmodSync(absoluteFilePath, newPermissions);
+          console.log(`Empowerment success for ${absoluteFilePath}: ${newPermissions.toString(8)}`);
+        } catch (err) {
+          console.error(`Empowerment failed for ${absoluteFilePath}: ${err}`);
+        }
       }
     });
   }
@@ -278,8 +406,15 @@ uuid: ${UUID}`;
   } else {
     console.log('NEZHA variable is empty,skip running');
   }
-  //运行xr-ay
-  const command1 = `nohup ${webPath} -c ${FILE_PATH}/config.json >/dev/null 2>&1 &`;
+  //运行sing-box
+  try {
+    await exec(`"${webPath}" check -c "${FILE_PATH}/config.json"`);
+    console.log(`${webName} config check success`);
+  } catch (error) {
+    console.error(`web config check error: ${error}`);
+    return;
+  }
+  const command1 = `nohup "${webPath}" run -c "${FILE_PATH}/config.json" >/dev/null 2>&1 &`;
   try {
     await exec(command1);
     console.log(`${webName} is running`);
@@ -287,6 +422,7 @@ uuid: ${UUID}`;
   } catch (error) {
     console.error(`web running error: ${error}`);
   }
+  await startTunnelRouter();
 
   // 运行cloud-fared
   if (fs.existsSync(botPath)) {
@@ -317,12 +453,12 @@ function getFilesForArchitecture(architecture) {
   let baseFiles;
   if (architecture === 'arm') {
     baseFiles = [
-      { fileName: webPath, fileUrl: "https://arm64.ssss.nyc.mn/web" },
+      { fileName: `${webPath}.tar.gz`, fileUrl: SING_BOX_ARM_URL, extract: 'sing-box', outputPath: webPath, extractDirName: `sing-box-${SING_BOX_VERSION}-linux-arm64` },
       { fileName: botPath, fileUrl: "https://arm64.ssss.nyc.mn/bot" }
     ];
   } else {
     baseFiles = [
-      { fileName: webPath, fileUrl: "https://amd64.ssss.nyc.mn/web" },
+      { fileName: `${webPath}.tar.gz`, fileUrl: SING_BOX_AMD_URL, extract: 'sing-box', outputPath: webPath, extractDirName: `sing-box-${SING_BOX_VERSION}-linux-amd64` },
       { fileName: botPath, fileUrl: "https://amd64.ssss.nyc.mn/bot" }
     ];
   }
@@ -460,13 +596,13 @@ async function generateLinks(argoDomain) {
   const nodeName = NAME ? `${NAME}-${ISP}` : ISP;
   return new Promise((resolve) => {
     setTimeout(() => {
-      const VMESS = { v: '2', ps: `${nodeName}`, add: CFIP, port: CFPORT, id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none', host: argoDomain, path: '/vmess-argo?ed=2560', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox'};
+      const VMESS = { v: '2', ps: `${nodeName}`, add: CFIP, port: CFPORT, id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none', host: argoDomain, path: '/vmess-argo', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox'};
       const subTxt = `
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
+vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo#${nodeName}
 
 vmess://${Buffer.from(JSON.stringify(VMESS)).toString('base64')}
 
-trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
+trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo#${nodeName}
     `;
       // 打印 sub.txt 内容到控制台
       console.log(Buffer.from(subTxt).toString('base64'));
@@ -552,20 +688,10 @@ function cleanFiles() {
       filesToDelete.push(phpPath);
     }
 
-    // Windows系统使用不同的删除命令
-    if (process.platform === 'win32') {
-      exec(`del /f /q ${filesToDelete.join(' ')} > nul 2>&1`, (error) => {
-        console.clear();
-        console.log('App is running');
-        console.log('Thank you for using this script, enjoy!');
-      });
-    } else {
-      exec(`rm -rf ${filesToDelete.join(' ')} >/dev/null 2>&1`, (error) => {
-        console.clear();
-        console.log('App is running');
-        console.log('Thank you for using this script, enjoy!');
-      });
-    }
+    filesToDelete.forEach(removePathSafely);
+    console.clear();
+    console.log('App is running');
+    console.log('Thank you for using this script, enjoy!');
   }, 90000); // 90s
 }
 cleanFiles();
@@ -608,9 +734,6 @@ async function startserver() {
     console.error('Error in startserver:', error);
   }
 }
-startserver().catch(error => {
-  console.error('Unhandled error in startserver:', error);
-});
 
 // 根路由
 app.get("/", async function(req, res) {
@@ -623,4 +746,8 @@ app.get("/", async function(req, res) {
   }
 });
 
-app.listen(PORT, () => console.log(`http server is running on port:${PORT}!`));
+appServer = app.listen(PORT, () => console.log(`http server is running on port:${PORT}!`));
+
+startserver().catch(error => {
+  console.error('Unhandled error in startserver:', error);
+});
